@@ -223,7 +223,7 @@ async function scrapeGnula(title, type, season, episode) {
   }
 }
 
-// ===== NUEVA FUNCIÓN: CONSUMET API =====
+// ===== FUNCIÓN CONSUMET API =====
 async function fetchFromConsumet(tmdbId, type, season, episode) {
   try {
     let consumetUrl;
@@ -244,7 +244,6 @@ async function fetchFromConsumet(tmdbId, type, season, episode) {
     const data = response.data;
     const sources = [];
     
-    // Procesar las fuentes de Consumet
     if (data.sources && Array.isArray(data.sources)) {
       for (const source of data.sources) {
         let lang = 'Latino';
@@ -283,7 +282,7 @@ app.get('/', (req, res) => {
   res.json({ status: 'ok', app: 'Mugiwarapp Backend', version: '2.0' });
 });
 
-// Endpoint principal: buscar streams (CONSUMET PRIORITARIO)
+// Endpoint principal: buscar streams
 app.get('/api/streams', async (req, res) => {
   const { tmdbId, type, season = 1, episode = 1, title = '' } = req.query;
 
@@ -294,12 +293,11 @@ app.get('/api/streams', async (req, res) => {
   console.log(`Buscando: ${type} ID:${tmdbId} T${season}E${episode}`);
 
   try {
-    // 1. PRIMERO: Intentar con Consumet (más confiable)
+    // 1. Intentar con Consumet
     let consumetSources = await fetchFromConsumet(tmdbId, type, season, episode);
-    
     let allSources = [...consumetSources];
     
-    // 2. SEGUNDO: Si Consumet no dio resultados, usar scrapers como respaldo
+    // 2. Si Consumet no dio resultados, usar scrapers
     if (consumetSources.length === 0) {
       console.log('Consumet sin resultados, usando scrapers...');
       const [cuevana, pelisplus, gnula] = await Promise.allSettled([
@@ -317,39 +315,25 @@ app.get('/api/streams', async (req, res) => {
       allSources = [...allSources, ...scrapedSources];
     }
     
-// 3. TERCERO: Fuentes múltiples por idioma y calidad (fallback mejorado)
-if (allSources.length === 0) {
-  const cleanId = tmdbId.startsWith('tt') ? tmdbId : `tt${tmdbId}`;
-  const numericId = cleanId.replace('tt', '');
-  
-  // Múltiples fuentes para PELÍCULAS
-  if (type === 'movie') {
-    // LATINO (múltiples opciones)
-    allSources.push({ url: `https://vidsrc.xyz/embed/movie/${cleanId}`, lang: 'Latino', quality: '1080p' });
-    allSources.push({ url: `https://vidsrc.to/embed/movie/${cleanId}`, lang: 'Latino', quality: '1080p' });
-    allSources.push({ url: `https://embed.su/embed/movie/${cleanId}`, lang: 'Latino', quality: '720p' });
-    
-    // ESPAÑA
-    allSources.push({ url: `https://www.2embed.to/embed/tmdb/movie?id=${numericId}&lang=es-ES`, lang: 'España', quality: '1080p' });
-    
-    // SUBTITULADO
-    allSources.push({ url: `https://vidsrc.xyz/embed/movie/${cleanId}`, lang: 'Subtitulado', quality: '1080p' });
-    allSources.push({ url: `https://autoembed.cc/embed/movie/${cleanId}`, lang: 'Subtitulado', quality: '720p' });
-  } 
-  // Múltiples fuentes para SERIES
-  else {
-    // LATINO
-    allSources.push({ url: `https://vidsrc.xyz/embed/tv/${cleanId}/${season}/${episode}`, lang: 'Latino', quality: '1080p' });
-    allSources.push({ url: `https://vidsrc.to/embed/tv/${cleanId}/${season}/${episode}`, lang: 'Latino', quality: '1080p' });
-    allSources.push({ url: `https://embed.su/embed/tv/${cleanId}/${season}/${episode}`, lang: 'Latino', quality: '720p' });
-    
-    // ESPAÑA (si existe)
-    allSources.push({ url: `https://www.2embed.to/embed/tmdb/tv?id=${numericId}&season=${season}&episode=${episode}&lang=es-ES`, lang: 'España', quality: '1080p' });
-    
-    // SUBTITULADO
-    allSources.push({ url: `https://vidsrc.xyz/embed/tv/${cleanId}/${season}/${episode}`, lang: 'Subtitulado', quality: '1080p' });
-  }
-}
+    // 3. Fuentes múltiples por idioma y calidad (fallback)
+    if (allSources.length === 0) {
+      const cleanId = tmdbId.startsWith('tt') ? tmdbId : `tt${tmdbId}`;
+      const numericId = cleanId.replace('tt', '');
+      
+      if (type === 'movie') {
+        allSources.push({ url: `https://vidsrc.xyz/embed/movie/${cleanId}`, lang: 'Latino', quality: '1080p' });
+        allSources.push({ url: `https://vidsrc.to/embed/movie/${cleanId}`, lang: 'Latino', quality: '1080p' });
+        allSources.push({ url: `https://embed.su/embed/movie/${cleanId}`, lang: 'Latino', quality: '720p' });
+        allSources.push({ url: `https://www.2embed.to/embed/tmdb/movie?id=${numericId}&lang=es-ES`, lang: 'España', quality: '1080p' });
+        allSources.push({ url: `https://autoembed.cc/embed/movie/${cleanId}`, lang: 'Subtitulado', quality: '720p' });
+        allSources.push({ url: `https://multiembed.mov/?video_id=${cleanId}&tmdb=1`, lang: 'Latino', quality: '1080p' });
+      } else {
+        allSources.push({ url: `https://vidsrc.xyz/embed/tv/${cleanId}/${season}/${episode}`, lang: 'Latino', quality: '1080p' });
+        allSources.push({ url: `https://vidsrc.to/embed/tv/${cleanId}/${season}/${episode}`, lang: 'Latino', quality: '1080p' });
+        allSources.push({ url: `https://embed.su/embed/tv/${cleanId}/${season}/${episode}`, lang: 'Latino', quality: '720p' });
+        allSources.push({ url: `https://www.2embed.to/embed/tmdb/tv?id=${numericId}&season=${season}&episode=${episode}&lang=es-ES`, lang: 'España', quality: '1080p' });
+      }
+    }
     
     // Deduplicar y ordenar
     const seen = new Set();
@@ -367,7 +351,7 @@ if (allSources.length === 0) {
       ...unique.filter(s => !['Latino','España','Subtitulado','Inglés'].includes(s.lang)),
     ];
     
-    console.log(`Encontradas ${ordered.length} fuentes (Consumet: ${consumetSources.length})`);
+    console.log(`Encontradas ${ordered.length} fuentes`);
     res.json({ sources: ordered, total: ordered.length });
 
   } catch (err) {
@@ -376,25 +360,64 @@ if (allSources.length === 0) {
   }
 });
 
-// Proxy para iframes (evita bloqueos CORS)
+// ===== PROXY CORREGIDO =====
 app.get('/api/proxy', async (req, res) => {
   const { url } = req.query;
-  if (!url) return res.status(400).json({ error: 'URL requerida' });
-
+  
+  if (!url) {
+    return res.status(400).json({ error: 'URL requerida' });
+  }
+  
   try {
-    const response = await axios.get(decodeURIComponent(url), {
-      headers: HEADERS,
-      timeout: 10000,
-      responseType: 'text',
+    const targetUrl = decodeURIComponent(url);
+    console.log(`Proxy solicitado: ${targetUrl.substring(0, 100)}...`);
+    
+    const response = await axios.get(targetUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'es-ES,es;q=0.8,en;q=0.5',
+        'Referer': 'https://www.google.com/',
+      },
+      timeout: 20000,
+      maxRedirects: 5,
+      responseType: 'text'
     });
-    res.setHeader('Content-Type', 'text/html');
+    
+    // Enviar la respuesta con el contenido original
+    res.setHeader('Content-Type', response.headers['content-type'] || 'text/html');
     res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.send(response.data);
-  } catch (err) {
-    res.status(500).json({ error: 'Error en proxy' });
+    
+  } catch (error) {
+    console.error('Proxy error:', error.message);
+    
+    // Intentar con headers más simples
+    try {
+      const targetUrl = decodeURIComponent(url);
+      const response = await axios.get(targetUrl, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36',
+        },
+        timeout: 15000,
+        responseType: 'text'
+      });
+      
+      res.setHeader('Content-Type', 'text/html');
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.send(response.data);
+    } catch (fallbackError) {
+      res.status(500).json({ 
+        error: 'Error en proxy', 
+        details: error.message,
+        url: decodeURIComponent(url).substring(0, 100)
+      });
+    }
   }
 });
 
+// Iniciar servidor
 app.listen(PORT, () => {
   console.log(`Mugiwarapp Backend corriendo en puerto ${PORT}`);
 });

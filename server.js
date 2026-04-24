@@ -1,5 +1,6 @@
 // ============================================
-// MUGIWARAPP BACKEND — Scraper de streams + Consumet API
+// MUGIWARAPP BACKEND — Buscador de ENLACES DIRECTOS
+// (Funciona como Cuevana: encuentra mp4, m3u8 de Streamtape, Dood, Filemoon, etc.)
 // ============================================
 
 const express = require('express');
@@ -22,8 +23,22 @@ const HEADERS = {
   'Referer': 'https://www.google.com/',
 };
 
-// ===== CONFIGURACIÓN CONSUMET =====
-const CONSUMET_API = 'https://api.consumet.org';
+// ===== LISTA DE SITIOS DONDE BUSCAR ENLACES =====
+const SOURCES = {
+  // SITIOS DE ALMACENAMIENTO (donde están los videos REALES)
+  videoHosts: [
+    'streamtape', 'doodstream', 'dood', 'filemoon', 'ok.ru', 'okru',
+    'mega.nz', 'mega', 'mixdrop', 'uqload', 'mp4upload', 'sendvid',
+    'vidlox', 'waaw', 'voe.sx', 'upstream', 'fembed', 'streamwish'
+  ],
+  // SITIOS DE BÚSQUEDA (como Cuevana)
+  searchSites: [
+    { name: 'Cuevana', url: 'https://cuevana3.com', scraper: scrapeCuevana },
+    { name: 'Pelisplus', url: 'https://pelisplus.app', scraper: scrapePelisplus },
+    { name: 'Gnula', url: 'https://gnula.nu', scraper: scrapeGnula },
+    { name: 'Repelis', url: 'https://repelis24.co', scraper: scrapeRepelis }
+  ]
+};
 
 // ===== UTILIDADES =====
 
@@ -41,149 +56,201 @@ async function fetchPage(url, extraHeaders = {}) {
   }
 }
 
-// Extraer iframes y fuentes de video de una página
-function extractSources(html) {
+// ===== LO MÁS IMPORTANTE: EXTRAER ENLACES DIRECTOS DE VIDEO =====
+function extractDirectVideoLinks(html, pageUrl = '') {
   if (!html) return [];
   const $ = cheerio.load(html);
-  const sources = [];
+  const sources = new Map(); // Usar Map para evitar duplicados
 
-  // Buscar iframes
+  // 1. Buscar en iframes (muchos sitios ponen el video dentro de iframes)
   $('iframe').each((_, el) => {
-    const src = $(el).attr('src') || $(el).attr('data-src');
-    if (src && isVideoSource(src)) {
-      sources.push({ type: 'iframe', url: fixUrl(src) });
+    const src = $(el).attr('src') || $(el).attr('data-src') || '';
+    if (src && isVideoHost(src)) {
+      sources.set(src, { url: fixUrl(src), type: 'iframe', quality: 'Auto' });
     }
   });
 
-  // Buscar fuentes de video directas
-  $('source').each((_, el) => {
+  // 2. Buscar etiquetas video y source directas
+  $('video source').each((_, el) => {
     const src = $(el).attr('src');
-    if (src) sources.push({ type: 'direct', url: fixUrl(src) });
+    if (src && isVideoHost(src)) {
+      sources.set(src, { url: fixUrl(src), type: 'direct', quality: $(el).attr('quality') || 'Auto' });
+    }
   });
 
-  // Buscar en scripts
-  const scriptContent = $('script').map((_, el) => $(el).html()).get().join('\n');
+  // 3. Buscar enlaces dentro de scripts (donde suelen estar los enlaces reales)
+  const scripts = $('script').map((_, el) => $(el).html()).get().join('\n');
+  
+  // Patrones para encontrar enlaces a video
   const patterns = [
-    /file:\s*["']([^"']+\.m3u8[^"']*)/g,
-    /source:\s*["']([^"']+\.mp4[^"']*)/g,
-    /["'](https?:\/\/[^"']*\.m3u8[^"']*)/g,
-    /["'](https?:\/\/[^"']*filemoon[^"']*)/g,
-    /["'](https?:\/\/[^"']*streamtape[^"']*)/g,
-    /["'](https?:\/\/[^"']*dood[^"']*)/g,
-    /["'](https?:\/\/[^"']*okru[^"']*)/g,
-    /["'](https?:\/\/[^"']*ok\.ru[^"']*)/g,
+    // Streamtape, Doodstream, Filemoon
+    /(?:src|file|source|video_url|file_url|link|url)\s*[:=]\s*['"]([^'"]*?(?:streamtape|dood|filemoon|ok\.ru|okru|mixdrop|uqload|mp4upload|sendvid|vidlox|waaw|voe|upstream|fembed|streamwish)[^'"]*?)['"]/gi,
+    // Enlaces directos .mp4 .m3u8
+    /(?:src|file|source|video_url|file_url|link|url)\s*[:=]\s*['"]([^'"]*?\.(?:mp4|m3u8|mkv|webm)[^'"]*?)['"]/gi,
+    // Enlaces en formato JSON
+    /"file"\s*:\s*"([^"]*?\.(?:mp4|m3u8)[^"]*?)"/gi,
+    /"url"\s*:\s*"([^"]*?\.(?:mp4|m3u8)[^"]*?)"/gi,
+    /"link"\s*:\s*"([^"]*?\.(?:mp4|m3u8)[^"]*?)"/gi,
+    // Enlaces en texto plano
+    /(https?:\/\/[^\s"'<>]+\.(?:mp4|m3u8|mkv|webm)[^\s"'<>]*)/gi,
+    // Ok.ru específico
+    /(?:src|data-url)\s*[:=]\s*['"]([^'"]*?ok\.ru[^'"]*?)['"]/gi,
   ];
 
   for (const pattern of patterns) {
     let match;
-    while ((match = pattern.exec(scriptContent)) !== null) {
-      if (isVideoSource(match[1])) {
-        sources.push({ type: 'script', url: fixUrl(match[1]) });
+    while ((match = pattern.exec(scripts)) !== null) {
+      const url = match[1];
+      if (url && (isVideoHost(url) || url.match(/\.(mp4|m3u8|mkv|webm)$/i))) {
+        if (!sources.has(url)) {
+          sources.set(url, { url: fixUrl(url), type: 'script', quality: detectQuality(url) });
+        }
       }
     }
   }
 
-  return [...new Map(sources.map(s => [s.url, s])).values()];
+  // 4. Buscar en atributos data-*
+  $('[data-video], [data-src-video], [data-url]').each((_, el) => {
+    const dataVideo = $(el).attr('data-video') || $(el).attr('data-src-video') || $(el).attr('data-url');
+    if (dataVideo && isVideoHost(dataVideo)) {
+      sources.set(dataVideo, { url: fixUrl(dataVideo), type: 'data', quality: 'Auto' });
+    }
+  });
+
+  return Array.from(sources.values());
 }
 
-function isVideoSource(url) {
+// Verificar si una URL es de un sitio que aloja videos
+function isVideoHost(url) {
   if (!url) return false;
-  const videoHosts = [
-    'filemoon', 'streamtape', 'doodstream', 'dood.',
-    'okru', 'ok.ru', 'fembed', 'streamwish',
-    'upstream', 'voe.sx', 'mixdrop', 'uqload',
-    'mp4upload', 'sendvid', 'vidlox', 'waaw',
-    'm3u8', '.mp4', 'hlsplay', 'cloudvideo',
-  ];
-  return videoHosts.some(h => url.toLowerCase().includes(h));
+  const urlLower = url.toLowerCase();
+  return SOURCES.videoHosts.some(host => urlLower.includes(host));
+}
+
+// Detectar calidad del video
+function detectQuality(url) {
+  const urlLower = url.toLowerCase();
+  if (urlLower.includes('1080') || urlLower.includes('1080p')) return '1080p';
+  if (urlLower.includes('720') || urlLower.includes('720p')) return '720p';
+  if (urlLower.includes('480') || urlLower.includes('480p')) return '480p';
+  return 'Auto';
+}
+
+// Detectar idioma (ahora priorizamos latino)
+function detectLanguageFromUrl(url, context = '') {
+  const combined = (url + context).toLowerCase();
+  if (combined.includes('latino') || combined.includes('lat') || combined.includes('es-la') || combined.includes('spanish')) return 'Latino';
+  if (combined.includes('castellano') || combined.includes('spain') || combined.includes('es-es')) return 'España';
+  if (combined.includes('sub') || combined.includes('subtitulo') || combined.includes('subtitle')) return 'Subtitulado';
+  if (combined.includes('english') || combined.includes('eng')) return 'Inglés';
+  return 'Latino'; // Por defecto latino porque es lo que buscamos
 }
 
 function fixUrl(url) {
+  if (!url) return '';
   if (url.startsWith('//')) return 'https:' + url;
-  if (url.startsWith('/')) return url;
   return url;
 }
 
-function detectLanguage(url, text = '') {
-  const combined = (url + text).toLowerCase();
-  if (combined.includes('latino') || combined.includes('lat') || combined.includes('es-la')) return 'Latino';
-  if (combined.includes('castellano') || combined.includes('spain') || combined.includes('es-es')) return 'España';
-  if (combined.includes('sub') || combined.includes('subtitulo')) return 'Subtitulado';
-  if (combined.includes('english') || combined.includes('eng')) return 'Inglés';
-  return 'Latino';
+// ===== SCRAPERS PARA CADA SITIO (BUSCAN ENLACES DIRECTOS) =====
+
+// Scraper genérico para cualquier sitio
+async function scrapeSite(baseUrl, searchPath, tmdbId, type, season, episode) {
+  try {
+    let searchUrl;
+    if (type === 'movie') {
+      searchUrl = `${baseUrl}/pelicula/${tmdbId}`;
+    } else {
+      searchUrl = `${baseUrl}/serie/${tmdbId}/temporada-${season}/episodio-${episode}`;
+    }
+    
+    const html = await fetchPage(searchUrl, { Referer: baseUrl });
+    if (!html) return [];
+    
+    const videoLinks = extractDirectVideoLinks(html, searchUrl);
+    return videoLinks.map(link => ({
+      url: link.url,
+      quality: link.quality,
+      lang: detectLanguageFromUrl(link.url, html),
+      source: baseUrl
+    }));
+  } catch (e) {
+    console.error(`Error scraping ${baseUrl}:`, e.message);
+    return [];
+  }
 }
 
-// ===== SCRAPERS POR SITIO (RESPALDO) =====
-
-// Cuevana3
+// Scraper específico para Cuevana
 async function scrapeCuevana(tmdbId, type, season, episode) {
   try {
-    const baseUrl = 'https://cuevana3.me';
-    const searchUrl = `${baseUrl}/buscar?q=${tmdbId}`;
-    const searchHtml = await fetchPage(searchUrl);
-    if (!searchHtml) return [];
-
-    const $ = cheerio.load(searchHtml);
-    let contentUrl = '';
-
-    $('a').each((_, el) => {
-      const href = $(el).attr('href') || '';
-      if (type === 'movie' && href.includes('/pelicula/')) contentUrl = href;
-      if (type === 'tv' && href.includes('/serie/')) contentUrl = href;
-    });
-
-    if (!contentUrl) return [];
-
-    let targetUrl = contentUrl.startsWith('http') ? contentUrl : baseUrl + contentUrl;
-
-    if (type === 'tv') {
-      targetUrl = `${targetUrl}/season/${season}/episode/${episode}`;
+    const baseUrl = 'https://cuevana3.com';
+    let targetUrl;
+    
+    if (type === 'movie') {
+      targetUrl = `${baseUrl}/pelicula/${tmdbId}`;
+    } else {
+      targetUrl = `${baseUrl}/serie/${tmdbId}/temporada-${season}/episodio-${episode}`;
     }
-
+    
     const html = await fetchPage(targetUrl, { Referer: baseUrl });
-    const sources = extractSources(html);
-
-    const $page = cheerio.load(html);
-    const serverLinks = [];
-    $page('.server-item, .option, [data-player]').each((_, el) => {
-      const url = $page(el).attr('data-player') || $page(el).attr('href') || '';
-      const lang = $page(el).text().trim();
-      if (url) serverLinks.push({ url: fixUrl(url), lang: detectLanguage(url, lang) });
+    if (!html) return [];
+    
+    const $ = cheerio.load(html);
+    const sources = [];
+    
+    // Buscar los servidores que ofrece Cuevana (Streamtape, Dood, etc.)
+    $('.server-item, .option-server, [data-server]').each((_, el) => {
+      const serverData = $(el).attr('data-server') || $(el).attr('data-link') || '';
+      const serverUrl = $(el).attr('data-url') || $(el).attr('href') || '';
+      const serverName = $(el).text().toLowerCase();
+      
+      if (serverData && isVideoHost(serverData)) {
+        sources.push({ url: fixUrl(serverData), quality: '1080p', lang: 'Latino' });
+      }
+      if (serverUrl && isVideoHost(serverUrl)) {
+        sources.push({ url: fixUrl(serverUrl), quality: '1080p', lang: 'Latino' });
+      }
+      if (serverName.includes('streamtape') || serverName.includes('dood') || serverName.includes('filemoon')) {
+        // El enlace puede estar en un atributo onclick
+        const onclick = $(el).attr('onclick') || '';
+        const urlMatch = onclick.match(/['"](https?:\/\/[^'"]+)['"]/);
+        if (urlMatch && isVideoHost(urlMatch[1])) {
+          sources.push({ url: fixUrl(urlMatch[1]), quality: '1080p', lang: 'Latino' });
+        }
+      }
     });
-
-    return [...serverLinks, ...sources.map(s => ({ url: s.url, lang: 'Latino' }))];
+    
+    // También extraer de iframes
+    const iframeSources = extractDirectVideoLinks(html);
+    sources.push(...iframeSources);
+    
+    return sources;
   } catch (e) {
     console.error('Cuevana error:', e.message);
     return [];
   }
 }
 
-// Pelisplus
+// Scraper para Pelisplus
 async function scrapePelisplus(tmdbId, type, season, episode) {
   try {
     const baseUrl = 'https://pelisplus.app';
-    const searchUrl = `${baseUrl}/search?q=${tmdbId}`;
-    const searchHtml = await fetchPage(searchUrl);
-    if (!searchHtml) return [];
-
-    const $ = cheerio.load(searchHtml);
-    let contentUrl = '';
-
-    $('a').each((_, el) => {
-      const href = $(el).attr('href') || '';
-      if (type === 'movie' && href.includes('/pelicula/')) contentUrl = href;
-      if (type === 'tv' && href.includes('/serie/')) contentUrl = href;
-    });
-
-    if (!contentUrl) return [];
-
-    let targetUrl = contentUrl.startsWith('http') ? contentUrl : baseUrl + contentUrl;
-    if (type === 'tv') targetUrl = `${targetUrl}/season/${season}/episode/${episode}`;
-
+    let targetUrl;
+    
+    if (type === 'movie') {
+      targetUrl = `${baseUrl}/ver-pelicula/${tmdbId}`;
+    } else {
+      targetUrl = `${baseUrl}/ver-serie/${tmdbId}/temporada-${season}/episodio-${episode}`;
+    }
+    
     const html = await fetchPage(targetUrl, { Referer: baseUrl });
-    return extractSources(html).map(s => ({
-      url: s.url,
-      lang: detectLanguage(s.url),
+    if (!html) return [];
+    
+    return extractDirectVideoLinks(html).map(link => ({
+      url: link.url,
+      quality: link.quality,
+      lang: 'Latino',
+      source: 'pelisplus'
     }));
   } catch (e) {
     console.error('Pelisplus error:', e.message);
@@ -191,31 +258,26 @@ async function scrapePelisplus(tmdbId, type, season, episode) {
   }
 }
 
-// Gnula
-async function scrapeGnula(title, type, season, episode) {
+// Scraper para Gnula
+async function scrapeGnula(tmdbId, type, season, episode) {
   try {
     const baseUrl = 'https://gnula.nu';
-    const searchUrl = `${baseUrl}/?s=${encodeURIComponent(title)}`;
-    const searchHtml = await fetchPage(searchUrl);
-    if (!searchHtml) return [];
-
-    const $ = cheerio.load(searchHtml);
-    let contentUrl = '';
-
-    $('.result-item a, article a').each((_, el) => {
-      if (!contentUrl) contentUrl = $(el).attr('href') || '';
-    });
-
-    if (!contentUrl) return [];
-
-    let targetUrl = type === 'tv'
-      ? `${contentUrl}season/${season}/episode/${episode}/`
-      : contentUrl;
-
+    let targetUrl;
+    
+    if (type === 'movie') {
+      targetUrl = `${baseUrl}/pelicula/${tmdbId}`;
+    } else {
+      targetUrl = `${baseUrl}/serie/${tmdbId}/temporada-${season}/episodio-${episode}`;
+    }
+    
     const html = await fetchPage(targetUrl, { Referer: baseUrl });
-    return extractSources(html).map(s => ({
-      url: s.url,
-      lang: detectLanguage(s.url),
+    if (!html) return [];
+    
+    return extractDirectVideoLinks(html).map(link => ({
+      url: link.url,
+      quality: link.quality,
+      lang: 'Latino',
+      source: 'gnula'
     }));
   } catch (e) {
     console.error('Gnula error:', e.message);
@@ -223,54 +285,29 @@ async function scrapeGnula(title, type, season, episode) {
   }
 }
 
-// ===== FUNCIÓN CONSUMET API =====
-async function fetchFromConsumet(tmdbId, type, season, episode) {
+// Scraper para Repelis
+async function scrapeRepelis(tmdbId, type, season, episode) {
   try {
-    let consumetUrl;
+    const baseUrl = 'https://repelis24.co';
+    let targetUrl;
     
     if (type === 'movie') {
-      consumetUrl = `${CONSUMET_API}/movies/tmdb/watch/${tmdbId}`;
+      targetUrl = `${baseUrl}/pelicula/${tmdbId}`;
     } else {
-      consumetUrl = `${CONSUMET_API}/meta/tmdb/watch/${tmdbId}?season=${season}&episode=${episode}`;
+      targetUrl = `${baseUrl}/serie/${tmdbId}/${season}/${episode}`;
     }
     
-    console.log(`Consultando Consumet: ${consumetUrl}`);
+    const html = await fetchPage(targetUrl, { Referer: baseUrl });
+    if (!html) return [];
     
-    const response = await axios.get(consumetUrl, {
-      headers: HEADERS,
-      timeout: 15000
-    });
-    
-    const data = response.data;
-    const sources = [];
-    
-    if (data.sources && Array.isArray(data.sources)) {
-      for (const source of data.sources) {
-        let lang = 'Latino';
-        const urlLower = (source.url + '').toLowerCase();
-        if (urlLower.includes('es-es') || urlLower.includes('spain')) lang = 'España';
-        else if (urlLower.includes('sub') || urlLower.includes('subtitle')) lang = 'Subtitulado';
-        else if (urlLower.includes('eng')) lang = 'Inglés';
-        
-        sources.push({
-          url: source.url,
-          quality: source.quality || 'Auto',
-          lang: lang,
-          source: 'consumet'
-        });
-      }
-    } else if (data.url) {
-      sources.push({
-        url: data.url,
-        quality: data.quality || 'Auto',
-        lang: 'Latino',
-        source: 'consumet'
-      });
-    }
-    
-    return sources;
-  } catch (error) {
-    console.error('Consumet error:', error.message);
+    return extractDirectVideoLinks(html).map(link => ({
+      url: link.url,
+      quality: link.quality,
+      lang: 'Latino',
+      source: 'repelis'
+    }));
+  } catch (e) {
+    console.error('Repelis error:', e.message);
     return [];
   }
 }
@@ -279,10 +316,10 @@ async function fetchFromConsumet(tmdbId, type, season, episode) {
 
 // Health check
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', app: 'Mugiwarapp Backend', version: '2.0' });
+  res.json({ status: 'ok', app: 'Mugiwarapp Backend - Stream Finder', version: '3.0' });
 });
 
-// Endpoint principal: buscar streams
+// Endpoint principal: buscar enlaces directos de video
 app.get('/api/streams', async (req, res) => {
   const { tmdbId, type, season = 1, episode = 1, title = '' } = req.query;
 
@@ -290,69 +327,58 @@ app.get('/api/streams', async (req, res) => {
     return res.status(400).json({ error: 'tmdbId es requerido' });
   }
 
-  console.log(`Buscando: ${type} ID:${tmdbId} T${season}E${episode}`);
+  // Limpiar ID (convertir tt12345 a 12345)
+  const cleanId = tmdbId.toString().replace(/^tt/, '');
+  console.log(`Buscando: ${type} ID:${cleanId} T${season}E${episode}`);
 
   try {
-    // 1. Intentar con Consumet
-    let consumetSources = await fetchFromConsumet(tmdbId, type, season, episode);
-    let allSources = [...consumetSources];
+    // ===== 1. BUSCAR EN TODOS LOS SITIOS DE SCRAPING (COMO CUEVANA) =====
+    console.log('🔍 Buscando en sitios de scraping (Cuevana, Pelisplus, Gnula, Repelis)...');
     
-    // 2. Si Consumet no dio resultados, usar scrapers
-    if (consumetSources.length === 0) {
-      console.log('Consumet sin resultados, usando scrapers...');
-      const [cuevana, pelisplus, gnula] = await Promise.allSettled([
-        scrapeCuevana(tmdbId, type, season, episode),
-        scrapePelisplus(tmdbId, type, season, episode),
-        scrapeGnula(title, type, season, episode),
-      ]);
-      
-      const scrapedSources = [
-        ...(cuevana.value || []),
-        ...(pelisplus.value || []),
-        ...(gnula.value || []),
-      ];
-      
-      allSources = [...allSources, ...scrapedSources];
-    }
+    const scrapers = [
+      scrapeCuevana(cleanId, type, season, episode),
+      scrapePelisplus(cleanId, type, season, episode),
+      scrapeGnula(cleanId, type, season, episode),
+      scrapeRepelis(cleanId, type, season, episode)
+    ];
     
-    // 3. Fuentes múltiples por idioma y calidad (fallback)
-    if (allSources.length === 0) {
-      const cleanId = tmdbId.startsWith('tt') ? tmdbId : `tt${tmdbId}`;
-      const numericId = cleanId.replace('tt', '');
-      
-      if (type === 'movie') {
-        allSources.push({ url: `https://vidsrc.xyz/embed/movie/${cleanId}`, lang: 'Latino', quality: '1080p' });
-        allSources.push({ url: `https://vidsrc.to/embed/movie/${cleanId}`, lang: 'Latino', quality: '1080p' });
-        allSources.push({ url: `https://embed.su/embed/movie/${cleanId}`, lang: 'Latino', quality: '720p' });
-        allSources.push({ url: `https://www.2embed.to/embed/tmdb/movie?id=${numericId}&lang=es-ES`, lang: 'España', quality: '1080p' });
-        allSources.push({ url: `https://autoembed.cc/embed/movie/${cleanId}`, lang: 'Subtitulado', quality: '720p' });
-        allSources.push({ url: `https://multiembed.mov/?video_id=${cleanId}&tmdb=1`, lang: 'Latino', quality: '1080p' });
-      } else {
-        allSources.push({ url: `https://vidsrc.xyz/embed/tv/${cleanId}/${season}/${episode}`, lang: 'Latino', quality: '1080p' });
-        allSources.push({ url: `https://vidsrc.to/embed/tv/${cleanId}/${season}/${episode}`, lang: 'Latino', quality: '1080p' });
-        allSources.push({ url: `https://embed.su/embed/tv/${cleanId}/${season}/${episode}`, lang: 'Latino', quality: '720p' });
-        allSources.push({ url: `https://www.2embed.to/embed/tmdb/tv?id=${numericId}&season=${season}&episode=${episode}&lang=es-ES`, lang: 'España', quality: '1080p' });
+    const results = await Promise.allSettled(scrapers);
+    
+    let allSources = [];
+    for (const result of results) {
+      if (result.value && result.value.length > 0) {
+        allSources.push(...result.value);
       }
     }
     
-    // Deduplicar y ordenar
+    console.log(`📊 Scrapers encontraron: ${allSources.length} enlaces directos`);
+    
+    // Filtrar enlaces válidos y eliminar duplicados
     const seen = new Set();
-    const unique = allSources.filter(s => {
+    const uniqueSources = allSources.filter(s => {
       if (!s.url || seen.has(s.url)) return false;
       seen.add(s.url);
       return true;
     });
     
-    const ordered = [
-      ...unique.filter(s => s.lang === 'Latino'),
-      ...unique.filter(s => s.lang === 'España'),
-      ...unique.filter(s => s.lang === 'Subtitulado'),
-      ...unique.filter(s => s.lang === 'Inglés'),
-      ...unique.filter(s => !['Latino','España','Subtitulado','Inglés'].includes(s.lang)),
-    ];
+    // Ordenar por calidad (1080p primero)
+    const ordered = uniqueSources.sort((a, b) => {
+      const qualityOrder = { '1080p': 0, '720p': 1, '480p': 2, 'Auto': 3 };
+      return (qualityOrder[a.quality] || 4) - (qualityOrder[b.quality] || 4);
+    });
     
-    console.log(`Encontradas ${ordered.length} fuentes`);
-    res.json({ sources: ordered, total: ordered.length });
+    console.log(`✅ Total enlaces únicos: ${ordered.length}`);
+    
+    // Mostrar algunos ejemplos
+    if (ordered.length > 0) {
+      console.log(`📹 Ejemplos: ${ordered.slice(0, 3).map(s => s.url.substring(0, 60)).join(', ')}`);
+    }
+    
+    res.json({ 
+      sources: ordered, 
+      total: ordered.length,
+      message: ordered.length === 0 ? 'No se encontraron enlaces. Puede que el contenido no esté disponible en latino.' : null
+    });
 
   } catch (err) {
     console.error('Error general:', err);
@@ -360,7 +386,7 @@ app.get('/api/streams', async (req, res) => {
   }
 });
 
-// ===== PROXY CORREGIDO =====
+// Proxy para evitar bloqueos CORS
 app.get('/api/proxy', async (req, res) => {
   const { url } = req.query;
   
@@ -370,11 +396,11 @@ app.get('/api/proxy', async (req, res) => {
   
   try {
     const targetUrl = decodeURIComponent(url);
-    console.log(`Proxy solicitado: ${targetUrl.substring(0, 100)}...`);
+    console.log(`🌐 Proxy: ${targetUrl.substring(0, 100)}...`);
     
     const response = await axios.get(targetUrl, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'es-ES,es;q=0.8,en;q=0.5',
         'Referer': 'https://www.google.com/',
@@ -384,40 +410,18 @@ app.get('/api/proxy', async (req, res) => {
       responseType: 'text'
     });
     
-    // Enviar la respuesta con el contenido original
     res.setHeader('Content-Type', response.headers['content-type'] || 'text/html');
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.send(response.data);
     
   } catch (error) {
     console.error('Proxy error:', error.message);
-    
-    // Intentar con headers más simples
-    try {
-      const targetUrl = decodeURIComponent(url);
-      const response = await axios.get(targetUrl, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36',
-        },
-        timeout: 15000,
-        responseType: 'text'
-      });
-      
-      res.setHeader('Content-Type', 'text/html');
-      res.setHeader('Access-Control-Allow-Origin', '*');
-      res.send(response.data);
-    } catch (fallbackError) {
-      res.status(500).json({ 
-        error: 'Error en proxy', 
-        details: error.message,
-        url: decodeURIComponent(url).substring(0, 100)
-      });
-    }
+    res.status(500).json({ error: 'Error en proxy', details: error.message });
   }
 });
 
 // Iniciar servidor
 app.listen(PORT, () => {
-  console.log(`Mugiwarapp Backend corriendo en puerto ${PORT}`);
+  console.log(`🚀 Mugiwarapp Backend corriendo en puerto ${PORT}`);
+  console.log(`📹 Modo: Búsqueda de enlaces directos (Streamtape, Dood, Filemoon, etc.)`);
 });

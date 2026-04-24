@@ -317,20 +317,39 @@ app.get('/api/streams', async (req, res) => {
       allSources = [...allSources, ...scrapedSources];
     }
     
-    // 3. TERCERO: Fallback a vidsrc si todo lo demás falla
-    if (allSources.length === 0) {
-      const cleanId = tmdbId.startsWith('tt') ? tmdbId : `tt${tmdbId}`;
-      const fallbackUrl = type === 'movie'
-        ? `https://vidsrc.xyz/embed/movie/${cleanId}`
-        : `https://vidsrc.xyz/embed/tv/${cleanId}/${season}/${episode}`;
-      
-      allSources.push({
-        url: fallbackUrl,
-        lang: 'Latino',
-        quality: 'Auto',
-        fallback: true
-      });
-    }
+// 3. TERCERO: Fuentes múltiples por idioma y calidad (fallback mejorado)
+if (allSources.length === 0) {
+  const cleanId = tmdbId.startsWith('tt') ? tmdbId : `tt${tmdbId}`;
+  const numericId = cleanId.replace('tt', '');
+  
+  // Múltiples fuentes para PELÍCULAS
+  if (type === 'movie') {
+    // LATINO (múltiples opciones)
+    allSources.push({ url: `https://vidsrc.xyz/embed/movie/${cleanId}`, lang: 'Latino', quality: '1080p' });
+    allSources.push({ url: `https://vidsrc.to/embed/movie/${cleanId}`, lang: 'Latino', quality: '1080p' });
+    allSources.push({ url: `https://embed.su/embed/movie/${cleanId}`, lang: 'Latino', quality: '720p' });
+    
+    // ESPAÑA
+    allSources.push({ url: `https://www.2embed.to/embed/tmdb/movie?id=${numericId}&lang=es-ES`, lang: 'España', quality: '1080p' });
+    
+    // SUBTITULADO
+    allSources.push({ url: `https://vidsrc.xyz/embed/movie/${cleanId}`, lang: 'Subtitulado', quality: '1080p' });
+    allSources.push({ url: `https://autoembed.cc/embed/movie/${cleanId}`, lang: 'Subtitulado', quality: '720p' });
+  } 
+  // Múltiples fuentes para SERIES
+  else {
+    // LATINO
+    allSources.push({ url: `https://vidsrc.xyz/embed/tv/${cleanId}/${season}/${episode}`, lang: 'Latino', quality: '1080p' });
+    allSources.push({ url: `https://vidsrc.to/embed/tv/${cleanId}/${season}/${episode}`, lang: 'Latino', quality: '1080p' });
+    allSources.push({ url: `https://embed.su/embed/tv/${cleanId}/${season}/${episode}`, lang: 'Latino', quality: '720p' });
+    
+    // ESPAÑA (si existe)
+    allSources.push({ url: `https://www.2embed.to/embed/tmdb/tv?id=${numericId}&season=${season}&episode=${episode}&lang=es-ES`, lang: 'España', quality: '1080p' });
+    
+    // SUBTITULADO
+    allSources.push({ url: `https://vidsrc.xyz/embed/tv/${cleanId}/${season}/${episode}`, lang: 'Subtitulado', quality: '1080p' });
+  }
+}
     
     // Deduplicar y ordenar
     const seen = new Set();

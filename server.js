@@ -1,5 +1,5 @@
 // ============================================
-// MUGIWARAPP BACKEND — Scraper de streams
+// MUGIWARAPP BACKEND — Scraper de streams + Consumet API
 // ============================================
 
 const express = require('express');
@@ -21,6 +21,9 @@ const HEADERS = {
   'Accept-Encoding': 'gzip, deflate, br',
   'Referer': 'https://www.google.com/',
 };
+
+// ===== CONFIGURACIÓN CONSUMET =====
+const CONSUMET_API = 'https://api.consumet.org';
 
 // ===== UTILIDADES =====
 
@@ -107,10 +110,10 @@ function detectLanguage(url, text = '') {
   if (combined.includes('castellano') || combined.includes('spain') || combined.includes('es-es')) return 'España';
   if (combined.includes('sub') || combined.includes('subtitulo')) return 'Subtitulado';
   if (combined.includes('english') || combined.includes('eng')) return 'Inglés';
-  return 'Latino'; // Por defecto asumimos latino
+  return 'Latino';
 }
 
-// ===== SCRAPERS POR SITIO =====
+// ===== SCRAPERS POR SITIO (RESPALDO) =====
 
 // Cuevana3
 async function scrapeCuevana(tmdbId, type, season, episode) {
@@ -140,7 +143,6 @@ async function scrapeCuevana(tmdbId, type, season, episode) {
     const html = await fetchPage(targetUrl, { Referer: baseUrl });
     const sources = extractSources(html);
 
-    // Intentar extraer opciones de servidor de Cuevana
     const $page = cheerio.load(html);
     const serverLinks = [];
     $page('.server-item, .option, [data-player]').each((_, el) => {
@@ -221,14 +223,67 @@ async function scrapeGnula(title, type, season, episode) {
   }
 }
 
+// ===== NUEVA FUNCIÓN: CONSUMET API =====
+async function fetchFromConsumet(tmdbId, type, season, episode) {
+  try {
+    let consumetUrl;
+    
+    if (type === 'movie') {
+      consumetUrl = `${CONSUMET_API}/movies/tmdb/watch/${tmdbId}`;
+    } else {
+      consumetUrl = `${CONSUMET_API}/meta/tmdb/watch/${tmdbId}?season=${season}&episode=${episode}`;
+    }
+    
+    console.log(`Consultando Consumet: ${consumetUrl}`);
+    
+    const response = await axios.get(consumetUrl, {
+      headers: HEADERS,
+      timeout: 15000
+    });
+    
+    const data = response.data;
+    const sources = [];
+    
+    // Procesar las fuentes de Consumet
+    if (data.sources && Array.isArray(data.sources)) {
+      for (const source of data.sources) {
+        let lang = 'Latino';
+        const urlLower = (source.url + '').toLowerCase();
+        if (urlLower.includes('es-es') || urlLower.includes('spain')) lang = 'España';
+        else if (urlLower.includes('sub') || urlLower.includes('subtitle')) lang = 'Subtitulado';
+        else if (urlLower.includes('eng')) lang = 'Inglés';
+        
+        sources.push({
+          url: source.url,
+          quality: source.quality || 'Auto',
+          lang: lang,
+          source: 'consumet'
+        });
+      }
+    } else if (data.url) {
+      sources.push({
+        url: data.url,
+        quality: data.quality || 'Auto',
+        lang: 'Latino',
+        source: 'consumet'
+      });
+    }
+    
+    return sources;
+  } catch (error) {
+    console.error('Consumet error:', error.message);
+    return [];
+  }
+}
+
 // ===== API ENDPOINTS =====
 
 // Health check
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', app: 'Mugiwarapp Backend', version: '1.0' });
+  res.json({ status: 'ok', app: 'Mugiwarapp Backend', version: '2.0' });
 });
 
-// Endpoint principal: buscar streams
+// Endpoint principal: buscar streams (CONSUMET PRIORITARIO)
 app.get('/api/streams', async (req, res) => {
   const { tmdbId, type, season = 1, episode = 1, title = '' } = req.query;
 
@@ -239,27 +294,52 @@ app.get('/api/streams', async (req, res) => {
   console.log(`Buscando: ${type} ID:${tmdbId} T${season}E${episode}`);
 
   try {
-    // Buscar en paralelo en todos los sitios
-    const [cuevana, pelisplus, gnula] = await Promise.allSettled([
-      scrapeCuevana(tmdbId, type, season, episode),
-      scrapePelisplus(tmdbId, type, season, episode),
-      scrapeGnula(title, type, season, episode),
-    ]);
-
-    const allSources = [
-      ...(cuevana.value || []),
-      ...(pelisplus.value || []),
-      ...(gnula.value || []),
-    ];
-
-    // Deduplicar y ordenar: Latino primero
+    // 1. PRIMERO: Intentar con Consumet (más confiable)
+    let consumetSources = await fetchFromConsumet(tmdbId, type, season, episode);
+    
+    let allSources = [...consumetSources];
+    
+    // 2. SEGUNDO: Si Consumet no dio resultados, usar scrapers como respaldo
+    if (consumetSources.length === 0) {
+      console.log('Consumet sin resultados, usando scrapers...');
+      const [cuevana, pelisplus, gnula] = await Promise.allSettled([
+        scrapeCuevana(tmdbId, type, season, episode),
+        scrapePelisplus(tmdbId, type, season, episode),
+        scrapeGnula(title, type, season, episode),
+      ]);
+      
+      const scrapedSources = [
+        ...(cuevana.value || []),
+        ...(pelisplus.value || []),
+        ...(gnula.value || []),
+      ];
+      
+      allSources = [...allSources, ...scrapedSources];
+    }
+    
+    // 3. TERCERO: Fallback a vidsrc si todo lo demás falla
+    if (allSources.length === 0) {
+      const cleanId = tmdbId.startsWith('tt') ? tmdbId : `tt${tmdbId}`;
+      const fallbackUrl = type === 'movie'
+        ? `https://vidsrc.xyz/embed/movie/${cleanId}`
+        : `https://vidsrc.xyz/embed/tv/${cleanId}/${season}/${episode}`;
+      
+      allSources.push({
+        url: fallbackUrl,
+        lang: 'Latino',
+        quality: 'Auto',
+        fallback: true
+      });
+    }
+    
+    // Deduplicar y ordenar
     const seen = new Set();
     const unique = allSources.filter(s => {
       if (!s.url || seen.has(s.url)) return false;
       seen.add(s.url);
       return true;
     });
-
+    
     const ordered = [
       ...unique.filter(s => s.lang === 'Latino'),
       ...unique.filter(s => s.lang === 'España'),
@@ -267,8 +347,8 @@ app.get('/api/streams', async (req, res) => {
       ...unique.filter(s => s.lang === 'Inglés'),
       ...unique.filter(s => !['Latino','España','Subtitulado','Inglés'].includes(s.lang)),
     ];
-
-    console.log(`Encontradas ${ordered.length} fuentes`);
+    
+    console.log(`Encontradas ${ordered.length} fuentes (Consumet: ${consumetSources.length})`);
     res.json({ sources: ordered, total: ordered.length });
 
   } catch (err) {
